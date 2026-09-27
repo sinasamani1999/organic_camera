@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+checkpoints/
+dataset/
+*.pth
+*.pt
