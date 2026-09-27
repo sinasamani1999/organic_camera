@@ -1,79 +1,38 @@
+"""CNN-GRU-Cross-Attention model that predicts the organic residual rotation of the next frame."""
 import torch
 import torch.nn as nn
 
-# Import classes created separately in previous steps
-import sys
-import os
+from models.Attention_Base import CrossAttention
+from models.CNN_Base import VisualBackbone
+from models.Temporal_Base import MOTION_DIM, TemporalBackbone
 
-# اضافه کردن مسیر ریشه پروژه به پایتون برای حل مشکل Import
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-try:
-    # حالت اول: وقتی از ریشه پروژه اجرا می‌شود
-    from models.CNN_Base import VisualBackbone
-    from models.Temporal_Base import TemporalBackbone
-    from models.Attention_Base import CrossAttention
-except ModuleNotFoundError:
-    # حالت دوم: وقتی فایل به صورت مستقیم و جداگانه اجرا می‌شود
-    from CNN_Base import VisualBackbone
-    from Temporal_Base import TemporalBackbone
-    from Attention_Base import CrossAttention
 class OrganicCameraModel(nn.Module):
-    def __init__(self, hidden_dim=128):
-        super(OrganicCameraModel, self).__init__()
-        
-        # 1. Initialize visual feature extraction layer (Phase 2.1)
-        self.visual_backbone = VisualBackbone(hidden_dim=hidden_dim)
-        
-        # 2. Initialize temporal hand motion processing layer (Phase 2.2)
-        self.temporal_backbone = TemporalBackbone(input_dim=2, hidden_size=64, hidden_dim=hidden_dim)
-        
-        # 3. Initialize Cross-Attention fusion layer (Phase 2.3)
-        self.cross_attention = CrossAttention(feature_dim=hidden_dim)
-        
-        # 4. Final linear regression layer
-        # Maps the 128-dimensional fused vector to 2 final values: [Predicted_Cam_X, Predicted_Cam_Y]
-        self.fc_out = nn.Linear(hidden_dim, 2)
+    def __init__(self, hidden_dim: int = 128, num_heads: int = 4, pretrained: bool = True,
+                 freeze_backbone: bool = True, use_visual: bool = True, use_attention: bool = True):
+        super().__init__()
+        self.use_visual = use_visual
+        self.use_attention = use_attention
+        self.temporal = TemporalBackbone(MOTION_DIM, 64, hidden_dim)
+        if use_visual:
+            self.visual = VisualBackbone(hidden_dim, pretrained=pretrained, freeze=freeze_backbone)
+            if use_attention:
+                self.cross = CrossAttention(hidden_dim, num_heads)
+        in_dim = hidden_dim * 2 if use_visual else hidden_dim
+        self.head = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 2))
 
-    def forward(self, video_frame, motion_sequence):
-        """
-        video_frame: [Batch_Size, 3, 224, 224] -> Game video frame
-        motion_sequence: [Batch_Size, Sequence_Length, 2] -> Hand movement sequence from past frames
-        """
-        # A) Extract visual features from the game scene
-        vis_feats = self.visual_backbone(video_frame) # Output: [Batch_Size, 128]
-        
-        # B) Extract dynamic features and acceleration from hand motion
-        motion_feats = self.temporal_backbone(motion_sequence) # Output: [Batch_Size, 128]
-        
-        # C) Intelligently fuse vision and motion using the Cross-Attention mechanism
-        fused_feats = self.cross_attention(vis_feats, motion_feats) # Output: [Batch_Size, 128]
-        
-        # D) Compute the final prediction for camera movement
-        camera_prediction = self.fc_out(fused_feats) # Output: [Batch_Size, 2]
-        
-        return camera_prediction
-
-# ====== Integrated AI Network Test Code ======
-if __name__ == "__main__":
-    # Simulate simultaneous input data (4 fully parallel samples)
-    batch_size = 4
-    seq_len = 10 # 10 historical frames
-    
-    dummy_frames = torch.randn(batch_size, 3, 224, 224) # Game frames
-    dummy_motions = torch.randn(batch_size, seq_len, 2)  # Player's mouse data
-    
-    # Instantiate the entire hybrid proposed model
-    full_model = OrganicCameraModel(hidden_dim=128)
-    
-    # Process simultaneously and get camera controller outputs
-    predicted_camera_move = full_model(dummy_frames, dummy_motions)
-    
-    print("========================================================")
-    print(" The entire CNN-GRU + Cross-Attention hybrid network architecture was built successfully.")
-    print("========================================================")
-    print(f"Input game frames shape: {dummy_frames.shape}")
-    print(f"Time-series mouse data shape: {dummy_motions.shape}")
-    print(f"Final output tensor shape (Predicted organic camera motion): {predicted_camera_move.shape}")
-    print("--- Sample numerical model output for a single frame (CamX, CamY) ---")
-    print(predicted_camera_move[0].detach().numpy())
+    def forward(self, frame: torch.Tensor, motion: torch.Tensor, return_attention: bool = False):
+        """frame: [B, 3, 224, 224], motion: [B, T, MOTION_DIM] -> residual [B, 2] (normalized units)."""
+        q = self.temporal(motion)
+        attn = None
+        if not self.use_visual:
+            fused = q
+        else:
+            tokens = self.visual(frame)
+            if self.use_attention:
+                ctx, attn = self.cross(tokens, q)
+            else:  # ablation: plain concatenation of pooled features
+                ctx = tokens.mean(dim=1)
+            fused = torch.cat([ctx, q], dim=-1)
+        out = self.head(fused)
+        return (out, attn) if return_attention else out

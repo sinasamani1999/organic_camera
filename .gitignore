@@ -4,3 +4,13 @@ checkpoints/
 dataset/
 *.pth
 *.pt
+.venv/
+runs/
+*.egg-info/
+# Unreal
+unreal/**/Binaries/
+unreal/**/Intermediate/
+unreal/**/Saved/
+unreal/**/DerivedDataCache/
+unreal/**/.vs/
+*.sln

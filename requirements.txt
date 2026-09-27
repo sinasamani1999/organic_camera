@@ -1,0 +1,10 @@
+# PyTorch for RTX 50-series: install first with
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+numpy
+pyyaml
+opencv-python
+pandas
+pillow
+python-osc
+tensorboard
+scipy

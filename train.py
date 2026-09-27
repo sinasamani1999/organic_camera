@@ -1,106 +1,121 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+"""Train the organic camera model.
 
-# 1. Import local modules from custom data pipeline and models folder
-from data_pipeline.Real_Camera_Dataset import OrganicCameraDataset
+    python train.py --config config.yaml
+"""
+import argparse
+import os
+import random
+
+import numpy as np
+import torch
+import yaml
+from torch.utils.data import DataLoader, random_split
+
+from data_pipeline.synthetic_dataset import SyntheticOrganicDataset
+from models.losses import OrganicCameraLoss
 from models.Organic_Camera_Model import OrganicCameraModel
 
-# 2. Hybrid Loss Function implementation (Position + Direction + Smoothness)
-class OrganicCameraLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=0.6, gamma=0.4):
-        """
-        alpha: Weight for position accuracy (MSE)
-        beta: Weight for direction alignment (Cosine Similarity)
-        gamma: Weight for physical smoothness (Inter-frame MSE)
-        """
-        super(OrganicCameraLoss, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.mse = nn.MSELoss()
 
-    def forward(self, predictions, targets, prev_predictions=None):
-        # A) Position Loss using standard Mean Squared Error
-        loss_position = self.mse(predictions, targets)
-        
-        # B) Directional Loss using Cosine Similarity normalization
-        cos_sim = F.cosine_similarity(predictions, targets, dim=-1)
-        loss_direction = torch.mean(1.0 - cos_sim)
-        
-        # C) Smoothness Loss by penalizing sudden acceleration changes
-        loss_smoothness = 0.0
-        if prev_predictions is not None:
-            loss_smoothness = self.mse(predictions, prev_predictions)
-            
-        # Total blended Multi-Task Loss calculation
-        total_loss = (self.alpha * loss_position) + \
-                     (self.beta * loss_direction) + \
-                     (self.gamma * loss_smoothness)
-                     
-        return total_loss
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-def train_model():
-    # 3. Target hardware accelerator setup (CUDA GPU or CPU fallback)
+
+def build_dataset(cfg):
+    kind = cfg["data"]["kind"]
+    if kind == "synthetic":
+        return SyntheticOrganicDataset(cfg["data"]["num_samples"], cfg["data"]["seq_len"], cfg["seed"])
+    raise ValueError(f"unknown dataset kind: {kind}")  # 'phone' is added in week 2
+
+
+class Normalizer:
+    """Per-feature mean/std from training data; saved in the checkpoint for inference."""
+
+    def __init__(self, m_mean, m_std, t_mean, t_std):
+        self.m_mean, self.m_std, self.t_mean, self.t_std = m_mean, m_std, t_mean, t_std
+
+    @classmethod
+    def fit(cls, dataset, max_items=2000):
+        ms, ts = [], []
+        for i in range(min(len(dataset), max_items)):
+            _, m, t = dataset[i]
+            ms.append(m.reshape(-1, m.shape[-1])); ts.append(t.reshape(-1, 2))
+        m, t = torch.cat(ms), torch.cat(ts)
+        return cls(m.mean(0), m.std(0).clamp_min(1e-6), t.mean(0), t.std(0).clamp_min(1e-6))
+
+    def to(self, device):
+        for k in ("m_mean", "m_std", "t_mean", "t_std"):
+            setattr(self, k, getattr(self, k).to(device))
+        return self
+
+    def motion(self, m): return (m - self.m_mean) / self.m_std
+    def target(self, t): return (t - self.t_mean) / self.t_std
+    def state(self): return {k: getattr(self, k).cpu() for k in ("m_mean", "m_std", "t_mean", "t_std")}
+
+
+def run_epoch(model, loader, criterion, norm, device, optimizer=None):
+    train = optimizer is not None
+    model.train(train)
+    total, n = 0.0, 0
+    with torch.set_grad_enabled(train):
+        for frames, motion, target in loader:
+            B = frames.shape[0]
+            frames = frames.to(device).flatten(0, 1)                  # [B*2, 3, H, W]
+            motion = norm.motion(motion.to(device)).flatten(0, 1)     # [B*2, T, 5]
+            target = norm.target(target.to(device))                   # [B, 2, 2]
+            pred = model(frames, motion).view(B, 2, 2)
+            loss, _ = criterion(pred, target)
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            total += loss.item() * B; n += B
+    return total / max(n, 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    cfg = yaml.safe_load(open(ap.parse_args().config, encoding="utf-8"))
+    set_seed(cfg["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Training process is running on: {device}")
+    print(f"device: {device} {torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}")
 
-    # 4. Data pipeline initialization for localized storage assets
-    dataset = OrganicCameraDataset(video_dir="dataset/train_videos", motion_dir="dataset/train_motions")
-    train_loader = DataLoader(dataset, batch_size=8, shuffle=True, drop_last=True)
+    ds = build_dataset(cfg)
+    n_val = max(1, int(len(ds) * cfg["data"]["val_fraction"]))
+    train_ds, val_ds = random_split(ds, [len(ds) - n_val, n_val], generator=torch.Generator().manual_seed(cfg["seed"]))
+    # NOTE: for real data the split must be by person (done in the dataset), not random frames.
+    tl = DataLoader(train_ds, cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["train"]["workers"], drop_last=True)
+    vl = DataLoader(val_ds, cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["train"]["workers"])
+    norm = Normalizer.fit(train_ds).to(device)
 
-    # 5. Instantiate the integrated network and allocate to device memory
-    model = OrganicCameraModel(hidden_dim=128).to(device)
+    m = cfg["model"]
+    model = OrganicCameraModel(m["hidden_dim"], m["num_heads"], m["pretrained"], m["freeze_backbone"],
+                               m["use_visual"], m["use_attention"]).to(device)
+    lw = cfg["loss"]
+    criterion = OrganicCameraLoss(lw["alpha"], lw["beta"], lw["gamma"], lw["min_norm"])
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=cfg["train"]["lr"])
 
-    # 6. Initialize the custom hybrid objective criterion and Adam optimizer
-    criterion = OrganicCameraLoss(alpha=1.0, beta=0.6, gamma=0.4)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(cfg["out_dir"])
+    except Exception:
+        writer = None
 
-    # 7. Main supervised optimization training loop
-    epochs = 5
-    print("🎬 Starting the training process with Hybrid Organic Loss...")
-    
-    for epoch in range(epochs):
-        model.train()
-        running_loss = 0.0
-        prev_preds = None  # Cache to monitor motion smoothness continuity
-        
-        for batch_idx, (frames, motions, targets) in enumerate(train_loader):
-            # Stream parallel batch tensors to target hardware device
-            frames = frames.to(device)
-            motions = motions.to(device)
-            targets = targets.to(device)
-            
-            # Clear historical tracking gradients
-            optimizer.zero_grad()
-            
-            # Forward pass inference
-            predictions = model(frames, motions)
-            
-            # Evaluate comprehensive multi-task blended criteria
-            loss = criterion(predictions, targets, prev_predictions=prev_preds)
-            
-            # Backward error propagation pass
-            loss.backward()
-            
-            # Optimize parameters across CNN, GRU, and Attention weights
-            optimizer.step()
-            
-            running_loss += loss.item()
-            
-            # Detach current states to prevent memory leaks across iterations
-            prev_preds = predictions.detach()
-            
-        epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch [{epoch+1}/{epochs}] -------> Model Average Loss: {epoch_loss:.4f}")
+    os.makedirs(cfg["out_dir"], exist_ok=True)
+    best = float("inf")
+    for epoch in range(cfg["train"]["epochs"]):
+        tr = run_epoch(model, tl, criterion, norm, device, opt)
+        va = run_epoch(model, vl, criterion, norm, device)
+        print(f"epoch {epoch + 1:3d}  train {tr:.4f}  val {va:.4f}")
+        if writer:
+            writer.add_scalars("loss", {"train": tr, "val": va}, epoch)
+        if va < best:
+            best = va
+            torch.save({"model": model.state_dict(), "norm": norm.state(), "config": cfg},
+                       os.path.join(cfg["out_dir"], "best.pth"))
+    print(f"best val loss {best:.4f} -> {cfg['out_dir']}/best.pth")
 
-    # 8. Checkpoint serialization for operational deployment
-    torch.save(model.state_dict(), "checkpoints/organic_camera_weights.pth")
-    print("💾 Training complete! Model weights saved successfully inside 'checkpoints/' folder.")
 
 if __name__ == "__main__":
-    # Execute the training pipeline execution wrapper
-    # train_model()
-    print("Trainer structure code (train.py) updated with Hybrid Loss and compiled successfully.")
+    main()
