@@ -8,3 +8,6 @@ pillow
 python-osc
 tensorboard
 scipy
+imageio-ffmpeg
+dxcam
+mss

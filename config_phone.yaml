@@ -1,0 +1,29 @@
+seed: 0
+out_dir: runs/phone
+
+data:
+  kind: phone
+  root: dataset/phone
+  seq_len: 10
+  val_people: [p05]      # person ids (clip names start with them); ignored for a single clip
+  test_people: [p06]
+
+model:
+  hidden_dim: 128
+  num_heads: 4
+  pretrained: true
+  freeze_backbone: true
+  use_visual: true
+  use_attention: true
+
+loss:
+  alpha: 1.0
+  beta: 0.6
+  gamma: 0.4
+  min_norm: 0.1
+
+train:
+  batch_size: 32
+  lr: 0.0003
+  epochs: 15
+  workers: 4

@@ -11,6 +11,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, random_split
 
+from data_pipeline.phone_dataset import build_phone_splits
 from data_pipeline.synthetic_dataset import SyntheticOrganicDataset
 from models.losses import OrganicCameraLoss
 from models.Organic_Camera_Model import OrganicCameraModel
@@ -20,11 +21,17 @@ def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset(cfg):
+def build_splits(cfg):
+    """Returns train, val datasets. Phone data is split by person (or by time for a single clip)."""
     kind = cfg["data"]["kind"]
+    if kind == "phone":
+        train_ds, val_ds, _ = build_phone_splits(cfg)
+        return train_ds, val_ds
     if kind == "synthetic":
-        return SyntheticOrganicDataset(cfg["data"]["num_samples"], cfg["data"]["seq_len"], cfg["seed"])
-    raise ValueError(f"unknown dataset kind: {kind}")  # 'phone' is added in week 2
+        ds = SyntheticOrganicDataset(cfg["data"]["num_samples"], cfg["data"]["seq_len"], cfg["seed"])
+        n_val = max(1, int(len(ds) * cfg["data"]["val_fraction"]))
+        return random_split(ds, [len(ds) - n_val, n_val], generator=torch.Generator().manual_seed(cfg["seed"]))
+    raise ValueError(f"unknown dataset kind: {kind}")
 
 
 class Normalizer:
@@ -55,7 +62,7 @@ class Normalizer:
 def run_epoch(model, loader, criterion, norm, device, optimizer=None):
     train = optimizer is not None
     model.train(train)
-    total, n = 0.0, 0
+    total, n, mae, mae0 = 0.0, 0, 0.0, 0.0
     with torch.set_grad_enabled(train):
         for frames, motion, target in loader:
             B = frames.shape[0]
@@ -70,7 +77,13 @@ def run_epoch(model, loader, criterion, norm, device, optimizer=None):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
             total += loss.item() * B; n += B
-    return total / max(n, 1)
+            # error in degrees: model vs "no organic layer" (predict zero residual)
+            true_deg = target * norm.t_std + norm.t_mean
+            pred_deg = pred.detach() * norm.t_std + norm.t_mean
+            mae += (pred_deg - true_deg).abs().mean().item() * B
+            mae0 += true_deg.abs().mean().item() * B
+    n = max(n, 1)
+    return total / n, mae / n, mae0 / n
 
 
 def main():
@@ -81,10 +94,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device} {torch.cuda.get_device_name(0) if device.type == 'cuda' else ''}")
 
-    ds = build_dataset(cfg)
-    n_val = max(1, int(len(ds) * cfg["data"]["val_fraction"]))
-    train_ds, val_ds = random_split(ds, [len(ds) - n_val, n_val], generator=torch.Generator().manual_seed(cfg["seed"]))
-    # NOTE: for real data the split must be by person (done in the dataset), not random frames.
+    train_ds, val_ds = build_splits(cfg)
+    print(f"samples: train {len(train_ds)}  val {len(val_ds)}")
     tl = DataLoader(train_ds, cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["train"]["workers"], drop_last=True)
     vl = DataLoader(val_ds, cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["train"]["workers"])
     norm = Normalizer.fit(train_ds).to(device)
@@ -105,11 +116,13 @@ def main():
     os.makedirs(cfg["out_dir"], exist_ok=True)
     best = float("inf")
     for epoch in range(cfg["train"]["epochs"]):
-        tr = run_epoch(model, tl, criterion, norm, device, opt)
-        va = run_epoch(model, vl, criterion, norm, device)
-        print(f"epoch {epoch + 1:3d}  train {tr:.4f}  val {va:.4f}")
+        tr, tr_mae, _ = run_epoch(model, tl, criterion, norm, device, opt)
+        va, va_mae, va_mae0 = run_epoch(model, vl, criterion, norm, device)
+        print(f"epoch {epoch + 1:3d}  train {tr:.4f}  val {va:.4f}  |  val MAE {va_mae:.3f} deg"
+              f" (zero-residual baseline {va_mae0:.3f} deg)")
         if writer:
             writer.add_scalars("loss", {"train": tr, "val": va}, epoch)
+            writer.add_scalars("val_mae_deg", {"model": va_mae, "zero": va_mae0}, epoch)
         if va < best:
             best = va
             torch.save({"model": model.state_dict(), "norm": norm.state(), "config": cfg},

@@ -14,3 +14,6 @@ unreal/**/Saved/
 unreal/**/DerivedDataCache/
 unreal/**/.vs/
 *.sln
+# UE template content (regenerated from the First Person template, too large for git)
+unreal/**/Content/
+unreal/**/.vsconfig

@@ -9,6 +9,10 @@
 #include "OSCClient.h"
 #include "OSCManager.h"
 #include "OSCServer.h"
+#include "HAL/FileManager.h"
+#include "Misc/DateTime.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 
 UOrganicCameraComponent::UOrganicCameraComponent()
 {
@@ -51,6 +55,7 @@ void UOrganicCameraComponent::BeginPlay()
 
 void UOrganicCameraComponent::EndPlay(const EEndPlayReason::Type Reason)
 {
+	StopOffsetLog();
 	if (OscServer)
 	{
 		OscServer->Stop();
@@ -83,6 +88,50 @@ void UOrganicCameraComponent::SetMode(EOrganicCameraMode NewMode)
 	UE_LOG(LogTemp, Log, TEXT("OrganicCamera: mode = %s"), *UEnum::GetValueAsString(Mode));
 }
 
+void UOrganicCameraComponent::ResetLayer()
+{
+	Time = 0.f;
+	StepRate = FRotator::ZeroRotator;
+	StepTimeLeft = 0.f;
+	{
+		FScopeLock Lock(&ResidualLock);
+		LatestAIResidual = FRotator::ZeroRotator;
+		bNewAIResidual = false;
+	}
+	SetMode(Mode);  // zeroes the offset and restarts the camera shake
+}
+
+void UOrganicCameraComponent::StartOffsetLog(const FString& Label)
+{
+	StopOffsetLog();
+	bLogging = true;
+	LogLabel = Label;
+	LogTime = 0.0;
+	LogLines.Reset();
+	if (APawn* P = Cast<APawn>(GetOwner()))
+	{
+		PrevControlForLog = P->GetControlRotation();
+	}
+	LogLines.Add(TEXT("time,frame,mode,control_pitch,control_yaw,offset_pitch,offset_yaw,view_pitch,view_yaw,speed"));
+	UE_LOG(LogTemp, Log, TEXT("OrganicCamera: offset log started (%s)"), *Label);
+}
+
+void UOrganicCameraComponent::StopOffsetLog()
+{
+	if (!bLogging)
+	{
+		return;
+	}
+	bLogging = false;
+	const FString Dir = FPaths::ProjectSavedDir() / TEXT("OrganicCamera") / TEXT("Logs");
+	IFileManager::Get().MakeDirectory(*Dir, true);
+	const FString ModeName = UEnum::GetValueAsString(Mode).Replace(TEXT("EOrganicCameraMode::"), TEXT(""));
+	const FString Path = Dir / FString::Printf(TEXT("%s_%s_%s.csv"), *LogLabel, *ModeName, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+	FFileHelper::SaveStringArrayToFile(LogLines, *Path);
+	UE_LOG(LogTemp, Log, TEXT("OrganicCamera: offset log (%d rows) saved to %s"), LogLines.Num() - 1, *Path);
+	LogLines.Reset();
+}
+
 void UOrganicCameraComponent::OnOscMessage(const FOSCMessage& Message, const FString& IPAddress, int32 Port)
 {
 	float Yaw = 0.f, Pitch = 0.f;
@@ -90,6 +139,7 @@ void UOrganicCameraComponent::OnOscMessage(const FOSCMessage& Message, const FSt
 	{
 		FScopeLock Lock(&ResidualLock);
 		LatestAIResidual = FRotator(Pitch, Yaw, 0.f);
+		bNewAIResidual = true;
 		LastAIMessageTime = FPlatformTime::Seconds();
 	}
 }
@@ -106,6 +156,10 @@ void UOrganicCameraComponent::HandleModeKeys()
 	if (PC->WasInputKeyJustPressed(EKeys::Two))   SetMode(EOrganicCameraMode::Perlin);
 	if (PC->WasInputKeyJustPressed(EKeys::Three)) SetMode(EOrganicCameraMode::CameraShake);
 	if (PC->WasInputKeyJustPressed(EKeys::Four))  SetMode(EOrganicCameraMode::AI);
+	if (PC->WasInputKeyJustPressed(EKeys::L))
+	{
+		if (bLogging) StopOffsetLog(); else StartOffsetLog(TEXT("manual"));
+	}
 }
 
 FRotator UOrganicCameraComponent::ComputeResidual(float DeltaTime)
@@ -116,15 +170,28 @@ FRotator UOrganicCameraComponent::ComputeResidual(float DeltaTime)
 		return FRotator::ZeroRotator;  // Perlin sets the offset directly in TickComponent
 	case EOrganicCameraMode::AI:
 	{
-		FScopeLock Lock(&ResidualLock);
-		// Stale data (Python stopped) -> no residual instead of repeating the last one.
-		if (FPlatformTime::Seconds() - LastAIMessageTime > 0.2)
 		{
-			return FRotator::ZeroRotator;
+			FScopeLock Lock(&ResidualLock);
+			// Stale data (Python stopped) -> stop adding residuals.
+			if (FPlatformTime::Seconds() - LastAIMessageTime > 0.2)
+			{
+				StepTimeLeft = 0.f;
+				bNewAIResidual = false;
+				return FRotator::ZeroRotator;
+			}
+			if (bNewAIResidual)
+			{
+				// Whatever is left of the previous step is added to the new one, so no rotation is lost.
+				const FRotator Leftover = StepRate * StepTimeLeft;
+				StepRate = (LatestAIResidual + Leftover) * (1.f / ModelStepSeconds);
+				StepTimeLeft = ModelStepSeconds;
+				bNewAIResidual = false;
+			}
 		}
-		const FRotator R = LatestAIResidual;
-		LatestAIResidual = FRotator::ZeroRotator;  // each residual is applied once
-		return R;
+		// Apply the residual as a constant rate over one model step (smooth at any render frame rate).
+		const float Dt = FMath::Min(DeltaTime, StepTimeLeft);
+		StepTimeLeft -= Dt;
+		return StepRate * Dt;
 	}
 	default:
 		return FRotator::ZeroRotator;  // Off and CameraShake (handled by the camera manager)
@@ -148,7 +215,7 @@ void UOrganicCameraComponent::TickComponent(float DeltaTime, ELevelTick TickType
 	const FRotator Control = Pawn->GetControlRotation();
 	const FRotator Intent = (Control - LastControlRotation).GetNormalized();
 	LastControlRotation = Control;
-	const float SpeedMs = Pawn->GetVelocity().Size2D() / 100.f;  // cm/s -> m/s
+	const float SpeedMs = SpeedOverride >= 0.f ? SpeedOverride : Pawn->GetVelocity().Size2D() / 100.f;  // m/s
 
 	if (OscClient)
 	{
@@ -173,11 +240,29 @@ void UOrganicCameraComponent::TickComponent(float DeltaTime, ELevelTick TickType
 	{
 		// Accumulate the organic residual into a bounded, slowly re-centring offset.
 		Offset += ComputeResidual(DeltaTime);
-		Offset *= (1.f - Leak);
+		Offset *= FMath::Exp(-LeakPerSecond * DeltaTime);
 	}
 	Offset.Yaw = FMath::Clamp(Offset.Yaw, -MaxOffsetDeg, MaxOffsetDeg);
 	Offset.Pitch = FMath::Clamp(Offset.Pitch, -MaxOffsetDeg, MaxOffsetDeg);
 	Offset.Roll = 0.f;
 
 	Camera->SetWorldRotation(Control + Offset);
+
+	if (bLogging)
+	{
+		// view = what the player camera manager rendered last frame (includes Camera Shake), relative to control
+		FRotator View = Control + Offset;
+		APlayerController* PC = Cast<APlayerController>(Pawn->GetController());
+		if (PC && PC->PlayerCameraManager)
+		{
+			View = PC->PlayerCameraManager->GetCameraRotation();
+		}
+		// GetCameraRotation() is the view rendered last frame, so compare it with last frame's control rotation;
+		// comparing with this frame's control would count the player's own turning as camera shake.
+		const FRotator ViewRel = (View - PrevControlForLog).GetNormalized();
+		PrevControlForLog = Control;
+		LogLines.Add(FString::Printf(TEXT("%.5f,%lld,%d,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f"), LogTime, FrameIndex,
+			static_cast<int32>(Mode), Control.Pitch, Control.Yaw, Offset.Pitch, Offset.Yaw, ViewRel.Pitch, ViewRel.Yaw, SpeedMs));
+		LogTime += DeltaTime;
+	}
 }

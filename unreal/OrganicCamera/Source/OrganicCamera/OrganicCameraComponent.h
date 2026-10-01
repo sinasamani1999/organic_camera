@@ -55,15 +55,36 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Organic Camera|CameraShake")
 	float ShakeScale = 1.0f;
 
-	/** Fraction of the accumulated organic offset removed per frame, keeps the offset centred. */
-	UPROPERTY(EditAnywhere, Category = "Organic Camera", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float Leak = 0.05f;
+	/** Re-centring rate of the accumulated organic offset (1/s). Offset decays by exp(-LeakPerSecond * dt) each frame,
+	 *  so the behaviour does not depend on the frame rate. 3.0/s equals the old 5% per frame at 60 fps. */
+	UPROPERTY(EditAnywhere, Category = "Organic Camera", meta = (ClampMin = "0.0"))
+	float LeakPerSecond = 3.0f;
+
+	/** Duration of one model step. Each residual from Python is spread evenly over this time instead of
+	 *  being applied in a single frame. */
+	UPROPERTY(EditAnywhere, Category = "Organic Camera|AI", meta = (ClampMin = "0.001"))
+	float ModelStepSeconds = 1.f / 30.f;
 
 	UPROPERTY(EditAnywhere, Category = "Organic Camera")
 	float MaxOffsetDeg = 3.0f;
 
 	UFUNCTION(BlueprintCallable, Category = "Organic Camera")
 	void SetMode(EOrganicCameraMode NewMode);
+
+	/** Clears offset, noise time and pending residuals and restarts the shake (used at the start of a replay). */
+	UFUNCTION(BlueprintCallable, Category = "Organic Camera")
+	void ResetLayer();
+
+	/** If >= 0, sent to Python instead of the pawn velocity (m/s). Set by the replay component during playback. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Organic Camera")
+	float SpeedOverride = -1.f;
+
+	/** Per-frame CSV log of control rotation and camera offset (Saved/OrganicCamera/Logs). Key L toggles it. */
+	UFUNCTION(BlueprintCallable, Category = "Organic Camera")
+	void StartOffsetLog(const FString& Label);
+
+	UFUNCTION(BlueprintCallable, Category = "Organic Camera")
+	void StopOffsetLog();
 
 	/** Frames since BeginPlay; sent to Python so logs from both sides can be aligned. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Organic Camera")
@@ -95,6 +116,18 @@ private:
 	float Time = 0.f;
 
 	FCriticalSection ResidualLock;
-	FRotator LatestAIResidual = FRotator::ZeroRotator;
+	FRotator LatestAIResidual = FRotator::ZeroRotator;  // newest residual not yet picked up by the game thread
+	bool bNewAIResidual = false;
 	double LastAIMessageTime = 0.0;
+
+	// residual being spread over the current model step (game thread only)
+	FRotator StepRate = FRotator::ZeroRotator;  // degrees per second
+	float StepTimeLeft = 0.f;
+
+	// offset log
+	bool bLogging = false;
+	FString LogLabel;
+	double LogTime = 0.0;
+	FRotator PrevControlForLog = FRotator::ZeroRotator;  // the camera manager's view is one frame old
+	TArray<FString> LogLines;
 };
