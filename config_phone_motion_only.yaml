@@ -1,5 +1,5 @@
 seed: 0
-out_dir: runs/phone
+out_dir: runs/phone_motion_only
 
 data:
   kind: phone
@@ -13,7 +13,7 @@ model:
   num_heads: 4
   pretrained: true
   freeze_backbone: true
-  use_visual: true
+  use_visual: false
   use_attention: true
 
 loss:

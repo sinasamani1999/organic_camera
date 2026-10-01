@@ -1,5 +1,5 @@
 seed: 0
-out_dir: runs/phone
+out_dir: runs/phone_no_attn
 
 data:
   kind: phone
@@ -14,7 +14,7 @@ model:
   pretrained: true
   freeze_backbone: true
   use_visual: true
-  use_attention: true
+  use_attention: false
 
 loss:
   alpha: 1.0

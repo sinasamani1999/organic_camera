@@ -11,3 +11,4 @@ scipy
 imageio-ffmpeg
 dxcam
 mss
+matplotlib

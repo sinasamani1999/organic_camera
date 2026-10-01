@@ -114,20 +114,31 @@ def main():
         writer = None
 
     os.makedirs(cfg["out_dir"], exist_ok=True)
-    best = float("inf")
+    patience = cfg["train"].get("patience")  # stop after this many epochs without a better val loss (None = off)
+    best, best_epoch, history = float("inf"), 0, []
     for epoch in range(cfg["train"]["epochs"]):
         tr, tr_mae, _ = run_epoch(model, tl, criterion, norm, device, opt)
         va, va_mae, va_mae0 = run_epoch(model, vl, criterion, norm, device)
         print(f"epoch {epoch + 1:3d}  train {tr:.4f}  val {va:.4f}  |  val MAE {va_mae:.3f} deg"
               f" (zero-residual baseline {va_mae0:.3f} deg)")
+        history.append(dict(epoch=epoch + 1, train_loss=tr, val_loss=va, train_mae_deg=tr_mae,
+                            val_mae_deg=va_mae, val_zero_mae_deg=va_mae0))
         if writer:
             writer.add_scalars("loss", {"train": tr, "val": va}, epoch)
             writer.add_scalars("val_mae_deg", {"model": va_mae, "zero": va_mae0}, epoch)
         if va < best:
-            best = va
-            torch.save({"model": model.state_dict(), "norm": norm.state(), "config": cfg},
+            best, best_epoch = va, epoch + 1
+            torch.save({"model": model.state_dict(), "norm": norm.state(), "config": cfg, "epoch": best_epoch},
                        os.path.join(cfg["out_dir"], "best.pth"))
-    print(f"best val loss {best:.4f} -> {cfg['out_dir']}/best.pth")
+        # training curves for chapter 4
+        with open(os.path.join(cfg["out_dir"], "history.csv"), "w") as f:
+            f.write(",".join(history[0].keys()) + "\n")
+            for h in history:
+                f.write(",".join(f"{v:.6f}" if isinstance(v, float) else str(v) for v in h.values()) + "\n")
+        if patience and epoch + 1 - best_epoch >= patience:
+            print(f"early stop: no improvement for {patience} epochs")
+            break
+    print(f"best val loss {best:.4f} at epoch {best_epoch} -> {cfg['out_dir']}/best.pth")
 
 
 if __name__ == "__main__":
