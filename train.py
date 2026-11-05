@@ -1,6 +1,13 @@
 """Train the organic camera model.
 
     python train.py --config config.yaml
+
+Two training modes:
+    one-step (default) : the residual history holds the real past residuals (teacher forcing)
+    rollout            : set train.rollout: K in the config. The model runs K steps on its own,
+                         the residual history starts at zero and is filled with its own outputs,
+                         exactly as in the live loop and in evaluate.py --mode free. The loss
+                         (RolloutLoss) is taken over all K steps and can include a spectral term.
 """
 import argparse
 import os
@@ -13,7 +20,7 @@ from torch.utils.data import DataLoader, random_split
 
 from data_pipeline.phone_dataset import build_phone_splits
 from data_pipeline.synthetic_dataset import SyntheticOrganicDataset
-from models.losses import OrganicCameraLoss
+from models.losses import OrganicCameraLoss, RolloutLoss
 from models.Organic_Camera_Model import OrganicCameraModel
 
 
@@ -25,7 +32,7 @@ def build_splits(cfg):
     """Returns train, val datasets. Phone data is split by person (or by time for a single clip)."""
     kind = cfg["data"]["kind"]
     if kind == "phone":
-        train_ds, val_ds, _ = build_phone_splits(cfg)
+        train_ds, val_ds, _ = build_phone_splits(cfg, rollout=bool(cfg["train"].get("rollout")))
         return train_ds, val_ds
     if kind == "synthetic":
         ds = SyntheticOrganicDataset(cfg["data"]["num_samples"], cfg["data"]["seq_len"], cfg["seed"])
@@ -43,8 +50,12 @@ class Normalizer:
     @classmethod
     def fit(cls, dataset, max_items=2000):
         ms, ts = [], []
-        for i in range(min(len(dataset), max_items)):
-            _, m, t = dataset[i]
+        get = getattr(dataset, "motion_target", None)  # avoids loading images when the dataset allows it
+        # evenly spaced over the whole training set: the items are ordered by clip, so the first
+        # max_items would all come from one idle clip (speed std 0 -> walking speed blown up to 1e6)
+        idx = np.unique(np.linspace(0, len(dataset) - 1, min(len(dataset), max_items)).astype(int))
+        for i in idx:
+            m, t = get(i) if get else dataset[i][1:]
             ms.append(m.reshape(-1, m.shape[-1])); ts.append(t.reshape(-1, 2))
         m, t = torch.cat(ms), torch.cat(ts)
         return cls(m.mean(0), m.std(0).clamp_min(1e-6), t.mean(0), t.std(0).clamp_min(1e-6))
@@ -86,6 +97,55 @@ def run_epoch(model, loader, criterion, norm, device, optimizer=None):
     return total / n, mae / n, mae0 / n
 
 
+def rollout(model, frames, motion, norm, T, K, use_visual):
+    """Free-running prediction of K steps.
+
+    frames [B, K, 3, H, W], motion [B, T+K, 5] in degrees (real intent and speed).
+    The residual columns of the history start at zero and are filled with the model's own outputs
+    (in degrees, before any gain), the same as evaluate.py --mode free and inference_loop.py.
+    Gradients flow back through the fed-back outputs. Returns pred [B, K, 2] in normalized units.
+    """
+    B = motion.shape[0]
+    res = [motion.new_zeros(B, 2)] * T
+    outs = []
+    for k in range(K):
+        win = torch.cat([motion[:, k:k + T, :2], torch.stack(res[k:k + T], 1), motion[:, k:k + T, 4:]], -1)
+        out = model(frames[:, k] if use_visual else None, norm.motion(win))
+        outs.append(out)
+        res.append(out * norm.t_std + norm.t_mean)
+    return torch.stack(outs, 1)
+
+
+def run_epoch_rollout(model, loader, criterion, norm, device, T, K, use_visual, optimizer=None):
+    """Like run_epoch, but every sample is a K-step free-running window.
+    Also returns the std ratio (prediction / real) of the residual, which shows whether the output
+    collapses towards zero."""
+    train = optimizer is not None
+    model.train(train)
+    total, n, mae, mae0, sp, st = 0.0, 0, 0.0, 0.0, 0.0, 0.0
+    with torch.set_grad_enabled(train):
+        for frames, motion, target in loader:
+            B = motion.shape[0]
+            frames, motion = frames.to(device, non_blocking=True), motion.to(device)
+            target = norm.target(target.to(device))                      # [B, K, 2]
+            pred = rollout(model, frames, motion, norm, T, K, use_visual)
+            loss, _ = criterion(pred, target)
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            total += loss.item() * B; n += B
+            true_deg = target * norm.t_std + norm.t_mean
+            pred_deg = pred.detach() * norm.t_std + norm.t_mean
+            mae += (pred_deg - true_deg).abs().mean().item() * B
+            mae0 += true_deg.abs().mean().item() * B
+            sp += pred_deg.pow(2).mean().item() * B
+            st += true_deg.pow(2).mean().item() * B
+    n = max(n, 1)
+    return total / n, mae / n, mae0 / n, (sp / max(st, 1e-12)) ** 0.5
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
@@ -104,7 +164,13 @@ def main():
     model = OrganicCameraModel(m["hidden_dim"], m["num_heads"], m["pretrained"], m["freeze_backbone"],
                                m["use_visual"], m["use_attention"]).to(device)
     lw = cfg["loss"]
-    criterion = OrganicCameraLoss(lw["alpha"], lw["beta"], lw["gamma"], lw["min_norm"])
+    K = cfg["train"].get("rollout")
+    T = cfg["data"]["seq_len"]
+    if K:
+        criterion = RolloutLoss(lw["alpha"], lw["beta"], lw["gamma"], lw.get("delta", 0.0), lw["min_norm"])
+        print(f"rollout training: {K} free-running steps per sample, spectral weight {lw.get('delta', 0.0)}")
+    else:
+        criterion = OrganicCameraLoss(lw["alpha"], lw["beta"], lw["gamma"], lw["min_norm"])
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=cfg["train"]["lr"])
 
     try:
@@ -117,12 +183,17 @@ def main():
     patience = cfg["train"].get("patience")  # stop after this many epochs without a better val loss (None = off)
     best, best_epoch, history = float("inf"), 0, []
     for epoch in range(cfg["train"]["epochs"]):
-        tr, tr_mae, _ = run_epoch(model, tl, criterion, norm, device, opt)
-        va, va_mae, va_mae0 = run_epoch(model, vl, criterion, norm, device)
+        if K:
+            tr, tr_mae, _, _ = run_epoch_rollout(model, tl, criterion, norm, device, T, K, m["use_visual"], opt)
+            va, va_mae, va_mae0, va_std = run_epoch_rollout(model, vl, criterion, norm, device, T, K, m["use_visual"])
+        else:
+            tr, tr_mae, _ = run_epoch(model, tl, criterion, norm, device, opt)
+            va, va_mae, va_mae0 = run_epoch(model, vl, criterion, norm, device)
+            va_std = float("nan")
         print(f"epoch {epoch + 1:3d}  train {tr:.4f}  val {va:.4f}  |  val MAE {va_mae:.3f} deg"
-              f" (zero-residual baseline {va_mae0:.3f} deg)")
+              f" (zero-residual baseline {va_mae0:.3f} deg)" + (f"  std ratio {va_std:.2f}" if K else ""))
         history.append(dict(epoch=epoch + 1, train_loss=tr, val_loss=va, train_mae_deg=tr_mae,
-                            val_mae_deg=va_mae, val_zero_mae_deg=va_mae0))
+                            val_mae_deg=va_mae, val_zero_mae_deg=va_mae0, val_std_ratio=va_std))
         if writer:
             writer.add_scalars("loss", {"train": tr, "val": va}, epoch)
             writer.add_scalars("val_mae_deg", {"model": va_mae, "zero": va_mae0}, epoch)

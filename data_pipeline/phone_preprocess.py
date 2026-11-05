@@ -71,15 +71,22 @@ def per_frame_rotation(ft, gyro, gt, acc, at):
     pitch = np.degrees(np.diff(np.interp(t, gt, cum(pitch_rate))))
     return yaw, pitch
 
+IDLE_BELOW = 0.3   # std of |acc| (m/s^2) below this: standing
+FAST_ABOVE = 3.0   # above this: fast walk / run (no fastwalk clips recorded yet)
+
 
 def speed_proxy(ft, acc, at):
     """Walking/running intensity from 1 s std of |acc|, mapped to the speeds Unreal will send."""
     mag = np.linalg.norm(acc, axis=1)
     fs = 1e9 / np.diff(at).mean()
     w = int(fs)
-    std = np.sqrt(np.maximum(np.convolve(mag ** 2, np.ones(w) / w, "same") - np.convolve(mag, np.ones(w) / w, "same") ** 2, 0))
+    # edge padding: zero padding would fake high activity in the first and last half second
+    m = np.pad(mag, (w // 2, w - 1 - w // 2), mode="edge")
+    k = np.ones(w) / w
+    std = np.sqrt(np.maximum(np.convolve(m ** 2, k, "valid") - np.convolve(m, k, "valid") ** 2, 0))
     s = np.interp(ft[:-1], at, std)
-    return np.select([s < 0.6, s < 3.0], [0.0, 1.4], 3.0)
+    # thresholds tuned on the office recordings: calm office walking is about 0.4-1.5
+    return np.select([s < IDLE_BELOW, s < FAST_ABOVE], [0.0, 1.4], 3.0)
 
 
 def extract_frames(video, out_dir, n):
