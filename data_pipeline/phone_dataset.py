@@ -7,6 +7,9 @@ Sample for time t (two consecutive steps, t and t+1, so the smoothness loss uses
 
 Splits are by clip, and clip names start with the person id (p01_walk_01), so a person is
 never in both train and test. For a single clip (test01) the split falls back to time blocks.
+
+PhoneRolloutDataset gives windows of K consecutive steps for free-running (rollout) training,
+where the residual history is produced by the model itself, as in the live loop.
 """
 import os
 
@@ -26,6 +29,12 @@ def load_motion(clip_dir):
         rows = list(csv.DictReader(f))
     feats = np.array([[float(r[k]) for k in FEATURES] for r in rows], dtype=np.float32)
     return feats  # [N, 5]; target residual = feats[:, 2:4]
+
+
+def load_frame(frames_dir, t):
+    img = np.asarray(Image.open(os.path.join(frames_dir, f"{t:06d}.jpg")).convert("RGB"), dtype=np.float32)
+    img = img.transpose(2, 0, 1) / 255.0
+    return torch.from_numpy((img - MEAN) / STD)
 
 
 def sample_indices(n_rows, seq_len, lo=0, hi=None):
@@ -61,9 +70,14 @@ class PhoneOrganicDataset(Dataset):
         return len(self.items)
 
     def _frame(self, frames_dir, t):
-        img = np.asarray(Image.open(os.path.join(frames_dir, f"{t:06d}.jpg")).convert("RGB"), dtype=np.float32)
-        img = img.transpose(2, 0, 1) / 255.0
-        return torch.from_numpy((img - MEAN) / STD)
+        return load_frame(frames_dir, t)
+
+    def motion_target(self, i):
+        """Motion and target of sample i without loading images (used to fit the normalizer)."""
+        ci, t = self.items[i]
+        feats = self.clips[ci][1]
+        motion = np.stack([feats[t + k - self.T:t + k] for k in range(2)])
+        return torch.from_numpy(motion), torch.from_numpy(np.ascontiguousarray(feats[t:t + 2, 2:4]))
 
     def __getitem__(self, i):
         ci, t = self.items[i]
@@ -74,10 +88,59 @@ class PhoneOrganicDataset(Dataset):
         return frames, torch.from_numpy(motion), torch.from_numpy(np.ascontiguousarray(target))
 
 
-def build_phone_splits(cfg):
+class PhoneRolloutDataset(Dataset):
+    """Windows of K consecutive steps starting at t0 (free-running training).
+
+        frames [K, 3, 224, 224]  frames t0..t0+K-1 ([K, 1] zeros when load_frames is False)
+        motion [T+K, 5]          rows t0-T..t0+K-1 with real values; during training the residual
+                                 columns are ignored and replaced by the model's own outputs
+        target [K, 2]            residual of rows t0..t0+K-1
+    """
+
+    def __init__(self, root, clips, seq_len=10, rollout=30, stride=5, load_frames=True):
+        self.T, self.K, self.load_frames = seq_len, rollout, load_frames
+        self.items, self.clips = [], []
+        for c in clips:
+            d = os.path.join(root, c)
+            feats = load_motion(d)
+            ci = len(self.clips)
+            self.clips.append((os.path.join(d, "frames"), feats))
+            self.items += [(ci, t0) for t0 in range(seq_len, len(feats) - rollout + 1, stride)]
+
+    def __len__(self):
+        return len(self.items)
+
+    def motion_target(self, i):
+        ci, t0 = self.items[i]
+        feats = self.clips[ci][1]
+        motion = feats[t0 - self.T:t0 + self.K]
+        target = feats[t0:t0 + self.K, 2:4]
+        return torch.from_numpy(np.ascontiguousarray(motion)), torch.from_numpy(np.ascontiguousarray(target))
+
+    def __getitem__(self, i):
+        ci, t0 = self.items[i]
+        motion, target = self.motion_target(i)
+        if self.load_frames:
+            frames = torch.stack([load_frame(self.clips[ci][0], t0 + k) for k in range(self.K)])
+        else:
+            frames = torch.zeros(self.K, 1)
+        return frames, motion, target
+
+
+def build_phone_splits(cfg, rollout=False):
+    """Train, val, test datasets. With rollout=True, train and val are PhoneRolloutDataset
+    (settings from cfg["train"]); test always stays a one-step dataset for evaluate.py."""
     d = cfg["data"]
     root, T = d["root"], d["seq_len"]
     clips = sorted(c for c in os.listdir(root) if os.path.isfile(os.path.join(root, c, "motion.csv")))
+    if rollout:
+        if len(clips) == 1:
+            raise ValueError("rollout training needs clips from several people")
+        tr, va, te = split_clips(clips, d.get("val_people", []), d.get("test_people", []))
+        t = cfg["train"]
+        mk = lambda cs: PhoneRolloutDataset(root, cs, T, t["rollout"], t.get("stride", 5),
+                                            cfg["model"].get("use_visual", True))
+        return mk(tr), mk(va), PhoneOrganicDataset(root, te, T)
     if len(clips) == 1:  # smoke test on one clip: 70/15/15 by time, 1 s gap to limit leakage
         c = clips
         return (PhoneOrganicDataset(root, c, T, (0.0, 0.69)),

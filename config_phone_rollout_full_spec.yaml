@@ -1,0 +1,34 @@
+seed: 0
+out_dir: runs/rollout_full_spec
+
+data:
+  kind: phone
+  root: dataset/phone
+  seq_len: 10
+  val_people: [p05]
+  test_people: [p06]
+
+model:
+  hidden_dim: 128
+  num_heads: 4
+  pretrained: true
+  freeze_backbone: true
+  use_visual: true
+  use_attention: true
+
+loss:
+  alpha: 1.0
+  beta: 0.6
+  gamma: 0.4
+  delta: 1.0         # spectral term of RolloutLoss (0 = off)
+  min_norm: 0.1
+
+train:
+  rollout: 30       # free-running steps per sample (1 s at 30 Hz)
+  stride: 15        # step between window starts
+  batch_size: 32
+  lr: 0.0003
+  epochs: 120
+  patience: 20
+  select: mae_std     # val MAE / zero MAE + |1 - std ratio|
+  workers: 4

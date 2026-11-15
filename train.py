@@ -181,6 +181,9 @@ def main():
 
     os.makedirs(cfg["out_dir"], exist_ok=True)
     patience = cfg["train"].get("patience")  # stop after this many epochs without a better val loss (None = off)
+    # checkpoint selection: "val_loss" (default) or "mae_std" = val MAE / zero MAE + |1 - std ratio|
+    # (rollout runs: the spectral term makes val_loss too noisy to pick the epoch)
+    select = cfg["train"].get("select", "val_loss")
     best, best_epoch, history = float("inf"), 0, []
     for epoch in range(cfg["train"]["epochs"]):
         if K:
@@ -197,8 +200,9 @@ def main():
         if writer:
             writer.add_scalars("loss", {"train": tr, "val": va}, epoch)
             writer.add_scalars("val_mae_deg", {"model": va_mae, "zero": va_mae0}, epoch)
-        if va < best:
-            best, best_epoch = va, epoch + 1
+        score = va if select == "val_loss" else va_mae / max(va_mae0, 1e-9) + abs(1.0 - va_std)
+        if score < best:
+            best, best_epoch = score, epoch + 1
             torch.save({"model": model.state_dict(), "norm": norm.state(), "config": cfg, "epoch": best_epoch},
                        os.path.join(cfg["out_dir"], "best.pth"))
         # training curves for chapter 4
@@ -209,7 +213,7 @@ def main():
         if patience and epoch + 1 - best_epoch >= patience:
             print(f"early stop: no improvement for {patience} epochs")
             break
-    print(f"best val loss {best:.4f} at epoch {best_epoch} -> {cfg['out_dir']}/best.pth")
+    print(f"best {select} {best:.4f} at epoch {best_epoch} -> {cfg['out_dir']}/best.pth")
 
 
 if __name__ == "__main__":

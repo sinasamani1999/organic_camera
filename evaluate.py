@@ -4,8 +4,8 @@
     python evaluate.py --ckpt runs/phone/best.pth --split val --attention 8
 
 For every checkpoint: predicts the residual of each frame of each test clip (one step, the same way
-the live loop does), compares it with the real residual and with two baselines (zero = no organic
-layer, Perlin with the same RMS), and writes
+the live loop does), compares it with the real residual and with three baselines (zero = no organic
+layer, Perlin with the same RMS, persistence = repeat the last real residual), and writes
     runs/eval/<name>/metrics.csv          one row per method, metrics of table 3-6
     runs/eval/<name>/per_clip.csv         the same per clip
     runs/eval/<name>/pred_<clip>.csv      frame, true and predicted yaw/pitch (for plots)
@@ -14,6 +14,8 @@ layer, Perlin with the same RMS), and writes
 Two evaluation modes for the residual history (section 3-4-5):
     teacher  : the history holds the real past residuals (as in training)
     free     : the history holds the model's own past predictions (as in the live loop)
+Persistence uses the real past residual, so it is only a fair reference for teacher mode: a model
+that is not clearly better than persistence in teacher mode has mostly learned to copy its input.
 """
 import argparse
 import os
@@ -130,7 +132,7 @@ def main():
         print(f"{name}: {len(ds.clips)} clips, {len(ds)} frames on {device}")
 
         modes = ["teacher", "free"] if args.mode == "both" else [args.mode]
-        all_true, all_pred = [], {m: [] for m in modes}
+        all_true, all_prev, all_pred = [], [], {m: [] for m in modes}
         per_clip = []
         for ci, (frames_dir, feats) in enumerate(ds.clips):
             clip = os.path.basename(os.path.dirname(frames_dir))
@@ -143,6 +145,7 @@ def main():
                 if rows is None:
                     rows = pd.DataFrame({"frame": ts, "true_yaw": true[:, 0], "true_pitch": true[:, 1]})
                     all_true.append(true)
+                    all_prev.append(feats[ts - 1, 2:4])
                 rows[f"{mode}_yaw"], rows[f"{mode}_pitch"] = pred[:, 0], pred[:, 1]
                 all_pred[mode].append(pred)
                 per_clip.append({"clip": clip, "method": f"model_{mode}", **em.all_metrics(pred, true)})
@@ -154,11 +157,12 @@ def main():
         methods = {f"model_{m}": np.concatenate(all_pred[m]) for m in modes}
         methods["zero"] = np.zeros_like(true)
         methods["perlin_matched"] = em.perlin_matched(true)
+        methods["persistence"] = np.concatenate(all_prev)
         res = pd.DataFrame([{"method": k, **em.all_metrics(v, true)} for k, v in methods.items()])
         res.insert(0, "model", name)
         res.to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
         pd.DataFrame(per_clip).to_csv(os.path.join(out_dir, "per_clip.csv"), index=False)
-        save_psd(true, {k: v for k, v in methods.items() if k != "zero"}, os.path.join(out_dir, "psd.png"))
+        save_psd(true, {k: v for k, v in methods.items() if k not in ("zero", "persistence")}, os.path.join(out_dir, "psd.png"))
         summary.append(res)
         cols = ["method", "mae_deg", "mae_ratio_to_zero", "std_ratio_yaw", "corr_yaw", "lsd_db_yaw"]
         print(res[cols].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
