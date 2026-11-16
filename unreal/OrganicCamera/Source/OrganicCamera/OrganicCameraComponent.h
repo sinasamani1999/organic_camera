@@ -45,8 +45,14 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Organic Camera|Perlin")
 	float PerlinAmplitudeDeg = 1.5f;
 
+	/** Base frequency of the fractal Perlin noise (typical walking step rate). */
 	UPROPERTY(EditAnywhere, Category = "Organic Camera|Perlin")
-	float PerlinFrequencyHz = 1.2f;
+	float PerlinFrequencyHz = 2.0f;
+
+	/** Octaves of the fractal Perlin noise: octave k has frequency x2^k and amplitude x0.5^k (1 = plain noise).
+	 *  Must match PERLIN_OCTAVES in eval_metrics.py. */
+	UPROPERTY(EditAnywhere, Category = "Organic Camera|Perlin", meta = (ClampMin = "1", ClampMax = "6"))
+	int32 PerlinOctaves = 3;
 
 	/** Assign a camera shake (e.g. a Blueprint using a Perlin/Wave pattern) for the CameraShake mode. */
 	UPROPERTY(EditAnywhere, Category = "Organic Camera|CameraShake")

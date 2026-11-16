@@ -232,9 +232,19 @@ void UOrganicCameraComponent::TickComponent(float DeltaTime, ELevelTick TickType
 	if (Mode == EOrganicCameraMode::Perlin)
 	{
 		// Classic procedural camera noise: the offset IS the noise value (no accumulation).
-		const float T = Time * PerlinFrequencyHz;
-		Offset = FRotator(PerlinAmplitudeDeg * FMath::PerlinNoise1D(T + 57.3f),
-		                  PerlinAmplitudeDeg * FMath::PerlinNoise1D(T), 0.f);
+		// Fractal Perlin (same formula as perlin_offset in eval_metrics.py): octave k has
+		// frequency PerlinFrequencyHz * 2^k and amplitude 0.5^k, normalised by the sum of amplitudes.
+		float NoiseYaw = 0.f, NoisePitch = 0.f, Norm = 0.f, A = 1.f, F = PerlinFrequencyHz;
+		for (int32 K = 0; K < FMath::Max(PerlinOctaves, 1); ++K)
+		{
+			const float T = Time * F + 13.1f * K;
+			NoiseYaw += A * FMath::PerlinNoise1D(T);
+			NoisePitch += A * FMath::PerlinNoise1D(T + 57.3f);
+			Norm += A;
+			A *= 0.5f;
+			F *= 2.f;
+		}
+		Offset = FRotator(PerlinAmplitudeDeg * NoisePitch / Norm, PerlinAmplitudeDeg * NoiseYaw / Norm, 0.f);
 	}
 	else
 	{

@@ -73,14 +73,35 @@ def perlin1d(x, seed=0):
     return 2.0 * ((1 - _fade(t)) * g0 * t + _fade(t) * g1 * (t - 1))
 
 
-def perlin_residual(n, amp_deg, freq_hz=1.2, fs=FS, seed=0):
+PERLIN_FREQ_HZ = 2.0   # base frequency = typical walking step rate
+PERLIN_OCTAVES = 3     # 2, 4, 8 Hz: covers the 1-3, 3-6 and 6-15 Hz bands
+PERLIN_PERSISTENCE = 0.5
+PERLIN_LACUNARITY = 2.0
+
+
+def perlin_offset(t, freq_hz=PERLIN_FREQ_HZ, octaves=PERLIN_OCTAVES, seed=0, phase=0.0):
+    """Fractal (multi-octave) Perlin noise in about [-1, 1], same formula as Unreal's mode 2.
+
+    Octave k has frequency freq_hz * 2^k and amplitude 0.5^k; the sum is divided by the sum of
+    the amplitudes. With one octave this is the plain single-frequency noise used before 15 Nov 2026.
+    """
+    out, norm = np.zeros_like(t, dtype=float), 0.0
+    for k in range(octaves):
+        a = PERLIN_PERSISTENCE ** k
+        out += a * perlin1d(t * freq_hz * PERLIN_LACUNARITY ** k + phase + 13.1 * k, seed + 2 * k)
+        norm += a
+    return out / norm
+
+
+def perlin_residual(n, amp_deg, freq_hz=PERLIN_FREQ_HZ, fs=FS, seed=0, octaves=PERLIN_OCTAVES):
     """Per-frame rotation produced by the Perlin camera offset (offset is the noise; residual is its change)."""
     t = np.arange(n + 1) / fs
-    off = np.stack([amp_deg * perlin1d(t * freq_hz, seed), amp_deg * perlin1d(t * freq_hz + 57.3, seed + 1)], 1)
+    off = np.stack([amp_deg * perlin_offset(t, freq_hz, octaves, seed),
+                    amp_deg * perlin_offset(t, freq_hz, octaves, seed + 1, phase=57.3)], 1)
     return np.diff(off, axis=0)
 
 
-def perlin_matched(true, freq_hz=1.2, seed=0):
+def perlin_matched(true, freq_hz=PERLIN_FREQ_HZ, seed=0, octaves=PERLIN_OCTAVES):
     """Perlin residual scaled to the same overall RMS as the real residual (the fair comparison of chapter 3)."""
-    r = perlin_residual(len(true), 1.0, freq_hz, seed=seed)
+    r = perlin_residual(len(true), 1.0, freq_hz, seed=seed, octaves=octaves)
     return r * (np.sqrt(np.mean(true ** 2)) / max(np.sqrt(np.mean(r ** 2)), 1e-12))
